@@ -21,6 +21,7 @@ import android.content.res.Resources
 import dagger.BindsInstance
 import dagger.Component
 import im.vector.app.ActiveSessionDataSource
+import im.vector.app.AppStateHandler
 import im.vector.app.EmojiCompatFontProvider
 import im.vector.app.EmojiCompatWrapper
 import im.vector.app.VectorApplication
@@ -34,13 +35,14 @@ import im.vector.app.features.call.webrtc.WebRtcCallManager
 import im.vector.app.features.configuration.VectorConfiguration
 import im.vector.app.features.crypto.keysrequest.KeyRequestHandler
 import im.vector.app.features.crypto.verification.IncomingVerificationRequestHandler
-import im.vector.app.features.grouplist.SelectedGroupDataSource
 import im.vector.app.features.home.AvatarRenderer
+import im.vector.app.features.home.CurrentSpaceSuggestedRoomListDataSource
 import im.vector.app.features.home.room.detail.RoomDetailPendingActionStore
 import im.vector.app.features.home.room.detail.timeline.helper.MatrixItemColorProvider
 import im.vector.app.features.home.room.detail.timeline.helper.RoomSummariesHolder
 import im.vector.app.features.html.EventHtmlRenderer
 import im.vector.app.features.html.VectorHtmlCompressor
+import im.vector.app.features.invite.AutoAcceptInvites
 import im.vector.app.features.login.ReAuthHelper
 import im.vector.app.features.navigation.Navigator
 import im.vector.app.features.notifications.NotifiableEventResolver
@@ -113,7 +115,9 @@ interface VectorComponent {
 
     fun errorFormatter(): ErrorFormatter
 
-    fun selectedGroupStore(): SelectedGroupDataSource
+    fun appStateHandler(): AppStateHandler
+
+    fun currentSpaceSuggestedRoomListDataSource(): CurrentSpaceSuggestedRoomListDataSource
 
     fun roomDetailPendingActionStore(): RoomDetailPendingActionStore
 
@@ -156,6 +160,8 @@ interface VectorComponent {
     fun reAuthHelper(): ReAuthHelper
 
     fun pinLocker(): PinLocker
+
+    fun autoAcceptInvites(): AutoAcceptInvites
 
     fun webRtcCallManager(): WebRtcCallManager
 

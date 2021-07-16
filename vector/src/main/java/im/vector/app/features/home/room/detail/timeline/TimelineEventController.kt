@@ -39,13 +39,13 @@ import im.vector.app.features.home.room.detail.UnreadState
 import im.vector.app.features.home.room.detail.timeline.factory.MergedHeaderItemFactory
 import im.vector.app.features.home.room.detail.timeline.factory.ReadReceiptsItemFactory
 import im.vector.app.features.home.room.detail.timeline.factory.TimelineItemFactory
+import im.vector.app.features.home.room.detail.timeline.factory.TimelineItemFactoryParams
 import im.vector.app.features.home.room.detail.timeline.helper.ContentDownloadStateTrackerBinder
 import im.vector.app.features.home.room.detail.timeline.helper.ContentUploadStateTrackerBinder
 import im.vector.app.features.home.room.detail.timeline.helper.TimelineControllerInterceptorHelper
 import im.vector.app.features.home.room.detail.timeline.helper.TimelineEventDiffUtilCallback
 import im.vector.app.features.home.room.detail.timeline.helper.TimelineEventVisibilityHelper
 import im.vector.app.features.home.room.detail.timeline.helper.TimelineEventVisibilityStateChangedListener
-import im.vector.app.features.home.room.detail.timeline.factory.TimelineItemFactoryParams
 import im.vector.app.features.home.room.detail.timeline.helper.TimelineMediaSizeProvider
 import im.vector.app.features.home.room.detail.timeline.item.AbsMessageItem
 import im.vector.app.features.home.room.detail.timeline.item.BasedMergedItem
@@ -163,9 +163,18 @@ class TimelineEventController @Inject constructor(private val dateFormatter: Vec
         override fun onChanged(position: Int, count: Int, payload: Any?) {
             synchronized(modelCache) {
                 assertUpdateCallbacksAllowed()
-                (position until (position + count)).forEach {
+                (position until position + count).forEach {
                     // Invalidate cache
                     modelCache[it] = null
+                }
+                // Also invalidate the first previous displayable event if
+                // it's sent by the same user so we are sure we have up to date information.
+                val invalidatedSenderId: String? = currentSnapshot.getOrNull(position)?.senderInfo?.userId
+                val prevDisplayableEventIndex = currentSnapshot.subList(0, position).indexOfLast {
+                    timelineEventVisibilityHelper.shouldShowEvent(it, eventIdToHighlight)
+                }
+                if (prevDisplayableEventIndex != -1 && currentSnapshot[prevDisplayableEventIndex].senderInfo.userId == invalidatedSenderId) {
+                    modelCache[prevDisplayableEventIndex] = null
                 }
                 requestModelBuild()
             }
@@ -340,10 +349,14 @@ class TimelineEventController @Inject constructor(private val dateFormatter: Vec
             val event = currentSnapshot[position]
             val nextEvent = currentSnapshot.nextOrNull(position)
             val prevEvent = currentSnapshot.prevOrNull(position)
+            val nextDisplayableEvent = currentSnapshot.subList(position + 1, currentSnapshot.size).firstOrNull {
+                timelineEventVisibilityHelper.shouldShowEvent(it, eventIdToHighlight)
+            }
             val params = TimelineItemFactoryParams(
                     event = event,
                     prevEvent = prevEvent,
                     nextEvent = nextEvent,
+                    nextDisplayableEvent = nextDisplayableEvent,
                     highlightedEventId = eventIdToHighlight,
                     lastSentEventIdWithoutReadReceipts = lastSentEventWithoutReadReceipts,
                     callback = callback
@@ -456,9 +469,10 @@ class TimelineEventController @Inject constructor(private val dateFormatter: Vec
     }
 
     private fun LoadingItem_.setVisibilityStateChangedListener(direction: Timeline.Direction): LoadingItem_ {
+        val host = this@TimelineEventController
         return onVisibilityStateChanged { _, _, visibilityState ->
             if (visibilityState == VisibilityState.VISIBLE) {
-                callback?.onLoadMore(direction)
+                host.callback?.onLoadMore(direction)
             }
         }
     }
@@ -498,8 +512,9 @@ class TimelineEventController @Inject constructor(private val dateFormatter: Vec
      * Return true if added
      */
     private fun LoadingItem_.addWhenLoading(direction: Timeline.Direction): Boolean {
-        val shouldAdd = timeline?.hasMoreToLoad(direction) ?: false
-        addIf(shouldAdd, this@TimelineEventController)
+        val host = this@TimelineEventController
+        val shouldAdd = host.timeline?.hasMoreToLoad(direction) ?: false
+        addIf(shouldAdd, host)
         return shouldAdd
     }
 

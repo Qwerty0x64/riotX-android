@@ -21,33 +21,38 @@ import android.hardware.camera2.CameraManager
 import androidx.core.content.getSystemService
 import im.vector.app.core.services.CallService
 import im.vector.app.core.utils.CountUpTimer
+import im.vector.app.core.utils.TextUtils.formatDuration
 import im.vector.app.features.call.CameraEventsHandlerAdapter
 import im.vector.app.features.call.CameraProxy
 import im.vector.app.features.call.CameraType
 import im.vector.app.features.call.CaptureFormat
 import im.vector.app.features.call.VectorCallActivity
+import im.vector.app.features.call.lookup.sipNativeLookup
 import im.vector.app.features.call.utils.asWebRTC
 import im.vector.app.features.call.utils.awaitCreateAnswer
 import im.vector.app.features.call.utils.awaitCreateOffer
 import im.vector.app.features.call.utils.awaitSetLocalDescription
 import im.vector.app.features.call.utils.awaitSetRemoteDescription
 import im.vector.app.features.call.utils.mapToCallCandidate
+import im.vector.app.features.session.coroutineScope
 import io.reactivex.disposables.Disposable
 import io.reactivex.subjects.PublishSubject
 import io.reactivex.subjects.ReplaySubject
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.matrix.android.sdk.api.extensions.orFalse
 import org.matrix.android.sdk.api.extensions.tryOrNull
 import org.matrix.android.sdk.api.session.Session
+import org.matrix.android.sdk.api.session.call.CallIdGenerator
 import org.matrix.android.sdk.api.session.call.CallState
 import org.matrix.android.sdk.api.session.call.MxCall
 import org.matrix.android.sdk.api.session.call.MxPeerConnectionState
 import org.matrix.android.sdk.api.session.call.TurnServerResponse
 import org.matrix.android.sdk.api.session.room.model.call.CallAnswerContent
+import org.matrix.android.sdk.api.session.room.model.call.CallAssertedIdentityContent
 import org.matrix.android.sdk.api.session.room.model.call.CallCandidatesContent
 import org.matrix.android.sdk.api.session.room.model.call.CallHangupContent
 import org.matrix.android.sdk.api.session.room.model.call.CallInviteContent
@@ -78,29 +83,38 @@ import java.util.concurrent.TimeUnit
 import javax.inject.Provider
 import kotlin.coroutines.CoroutineContext
 
-private const val STREAM_ID = "ARDAMS"
-private const val AUDIO_TRACK_ID = "ARDAMSa0"
-private const val VIDEO_TRACK_ID = "ARDAMSv0"
+private const val STREAM_ID = "userMedia"
+private const val AUDIO_TRACK_ID = "${STREAM_ID}a0"
+private const val VIDEO_TRACK_ID = "${STREAM_ID}v0"
 private val DEFAULT_AUDIO_CONSTRAINTS = MediaConstraints()
 
-class WebRtcCall(val mxCall: MxCall,
-                 private val rootEglBase: EglBase?,
-                 private val context: Context,
-                 private val dispatcher: CoroutineContext,
-                 private val sessionProvider: Provider<Session?>,
-                 private val peerConnectionFactoryProvider: Provider<PeerConnectionFactory?>,
-                 private val onCallBecomeActive: (WebRtcCall) -> Unit,
-                 private val onCallEnded: (String) -> Unit) : MxCall.StateListener {
+class WebRtcCall(
+        val mxCall: MxCall,
+        // This is where the call is placed from an ui perspective.
+        // In case of virtual room, it can differs from the signalingRoomId.
+        val nativeRoomId: String,
+        private val rootEglBase: EglBase?,
+        private val context: Context,
+        private val dispatcher: CoroutineContext,
+        private val sessionProvider: Provider<Session?>,
+        private val peerConnectionFactoryProvider: Provider<PeerConnectionFactory?>,
+        private val onCallBecomeActive: (WebRtcCall) -> Unit,
+        private val onCallEnded: (String) -> Unit
+) : MxCall.StateListener {
 
     interface Listener : MxCall.StateListener {
         fun onCaptureStateChanged() {}
         fun onCameraChanged() {}
         fun onHoldUnhold() {}
+        fun assertedIdentityChanged() {}
         fun onTick(formattedDuration: String) {}
         override fun onStateUpdate(call: MxCall) {}
     }
 
     private val listeners = CopyOnWriteArrayList<Listener>()
+
+    private val sessionScope: CoroutineScope?
+        get() = sessionProvider.get()?.coroutineScope
 
     fun addListener(listener: Listener) {
         listeners.add(listener)
@@ -111,7 +125,9 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     val callId = mxCall.callId
-    val roomId = mxCall.roomId
+
+    // room where call signaling is placed. In case of virtual room it can differs from the nativeRoomId.
+    val signalingRoomId = mxCall.roomId
 
     private var peerConnection: PeerConnection? = null
     private var localAudioSource: AudioSource? = null
@@ -155,6 +171,8 @@ class WebRtcCall(val mxCall: MxCall,
 
     // This value is used to track localOnHold when changing remoteOnHold value
     private var wasLocalOnHold = false
+    var remoteAssertedIdentity: CallAssertedIdentityContent.AssertedIdentity? = null
+        private set
 
     var offerSdp: CallInviteContent.Offer? = null
 
@@ -190,7 +208,7 @@ class WebRtcCall(val mxCall: MxCall,
     fun onIceCandidate(iceCandidate: IceCandidate) = iceCandidateSource.onNext(iceCandidate)
 
     fun onRenegotiationNeeded(restartIce: Boolean) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             if (mxCall.state != CallState.CreateOffer && mxCall.opponentVersion == 0) {
                 Timber.v("Opponent does not support renegotiation: ignoring onRenegotiationNeeded event")
                 return@launch
@@ -256,14 +274,79 @@ class WebRtcCall(val mxCall: MxCall,
         peerConnection = peerConnectionFactory.createPeerConnection(rtcConfig, PeerConnectionObserver(this))
     }
 
-    fun attachViewRenderers(localViewRenderer: SurfaceViewRenderer?, remoteViewRenderer: SurfaceViewRenderer, mode: String?) {
-        Timber.v("## VOIP attachViewRenderers localRendeder $localViewRenderer / $remoteViewRenderer")
-        localSurfaceRenderers.addIfNeeded(localViewRenderer)
-        remoteSurfaceRenderers.addIfNeeded(remoteViewRenderer)
+    /**
+     * Without consultation
+     */
+    fun transferToUser(targetUserId: String, targetRoomId: String?) {
+        sessionScope?.launch(dispatcher) {
+            mxCall.transfer(
+                    targetUserId = targetUserId,
+                    targetRoomId = targetRoomId,
+                    createCallId = CallIdGenerator.generate(),
+                    awaitCallId = null
+            )
+            endCall(sendEndSignaling = false)
+        }
+    }
 
-        GlobalScope.launch(dispatcher) {
+    /**
+     * With consultation
+     */
+    fun transferToCall(transferTargetCall: WebRtcCall) {
+        sessionScope?.launch(dispatcher) {
+            val newCallId = CallIdGenerator.generate()
+            transferTargetCall.mxCall.transfer(
+                    targetUserId = mxCall.opponentUserId,
+                    targetRoomId = null,
+                    createCallId = null,
+                    awaitCallId = newCallId
+            )
+            mxCall.transfer(
+                    targetUserId = transferTargetCall.mxCall.opponentUserId,
+                    targetRoomId = null,
+                    createCallId = newCallId,
+                    awaitCallId = null
+            )
+            endCall(sendEndSignaling = false)
+            transferTargetCall.endCall(sendEndSignaling = false)
+        }
+    }
+
+    fun acceptIncomingCall() {
+        sessionScope?.launch {
+            Timber.v("## VOIP acceptIncomingCall from state ${mxCall.state}")
+            if (mxCall.state == CallState.LocalRinging) {
+                internalAcceptIncomingCall()
+            }
+        }
+    }
+
+    /**
+     * Sends a DTMF digit to the other party
+     * @param digit The digit (nb. string - '#' and '*' are dtmf too)
+     */
+    fun sendDtmfDigit(digit: String) {
+        sessionScope?.launch {
+            for (sender in peerConnection?.senders.orEmpty()) {
+                if (sender.track()?.kind() == "audio" && sender.dtmf()?.canInsertDtmf() == true) {
+                    try {
+                        sender.dtmf()?.insertDtmf(digit, 100, 70)
+                        return@launch
+                    } catch (failure: Throwable) {
+                        Timber.v("Fail to send Dtmf digit")
+                    }
+                }
+            }
+        }
+    }
+
+    fun attachViewRenderers(localViewRenderer: SurfaceViewRenderer?, remoteViewRenderer: SurfaceViewRenderer, mode: String?) {
+        sessionScope?.launch(dispatcher) {
+            Timber.v("## VOIP attachViewRenderers localRendeder $localViewRenderer / $remoteViewRenderer")
+            localSurfaceRenderers.addIfNeeded(localViewRenderer)
+            remoteSurfaceRenderers.addIfNeeded(remoteViewRenderer)
             when (mode) {
-                VectorCallActivity.INCOMING_ACCEPT -> {
+                VectorCallActivity.INCOMING_ACCEPT  -> {
                     internalAcceptIncomingCall()
                 }
                 VectorCallActivity.INCOMING_RINGING -> {
@@ -281,33 +364,31 @@ class WebRtcCall(val mxCall: MxCall,
         }
     }
 
-    fun acceptIncomingCall() {
-        GlobalScope.launch {
-            Timber.v("## VOIP acceptIncomingCall from state ${mxCall.state}")
-            if (mxCall.state == CallState.LocalRinging) {
-                internalAcceptIncomingCall()
+    private suspend fun attachViewRenderersInternal() = withContext(dispatcher) {
+        // render local video in pip view
+        localSurfaceRenderers.forEach { renderer ->
+            renderer.get()?.let { pipSurface ->
+                pipSurface.setMirror(cameraInUse?.type == CameraType.FRONT)
+                // no need to check if already added, addSink is checking that
+                localVideoTrack?.addSink(pipSurface)
             }
         }
-    }
 
-    /**
-     * Sends a DTMF digit to the other party
-     * @param digit The digit (nb. string - '#' and '*' are dtmf too)
-     */
-    fun sendDtmfDigit(digit: String) {
-        for (sender in peerConnection?.senders.orEmpty()) {
-            if (sender.track()?.kind() == "audio" && sender.dtmf()?.canInsertDtmf() == true) {
-                try {
-                    sender.dtmf()?.insertDtmf(digit, 100, 70)
-                    return
-                } catch (failure: Throwable) {
-                    Timber.v("Fail to send Dtmf digit")
-                }
+        // If remote track exists, then sink it to surface
+        remoteSurfaceRenderers.forEach { renderer ->
+            renderer.get()?.let { participantSurface ->
+                remoteVideoTrack?.addSink(participantSurface)
             }
         }
     }
 
     fun detachRenderers(renderers: List<SurfaceViewRenderer>?) {
+        sessionScope?.launch(dispatcher) {
+            detachRenderersInternal(renderers)
+        }
+    }
+
+    private suspend fun detachRenderersInternal(renderers: List<SurfaceViewRenderer>?) = withContext(dispatcher) {
         Timber.v("## VOIP detachRenderers")
         if (renderers.isNullOrEmpty()) {
             // remove all sinks
@@ -380,6 +461,7 @@ class WebRtcCall(val mxCall: MxCall,
             peerConnection?.awaitSetRemoteDescription(offerSdp)
         } catch (failure: Throwable) {
             Timber.v("Failure putting remote description")
+            endCall(true, CallHangupContent.Reason.UNKWOWN_ERROR)
             return@withContext
         }
         // 2) Access camera + microphone, create local stream
@@ -397,24 +479,6 @@ class WebRtcCall(val mxCall: MxCall,
         }, {
             Timber.v("## VOIP failed to add remote ice candidate $it")
         })
-    }
-
-    private fun attachViewRenderersInternal() {
-        // render local video in pip view
-        localSurfaceRenderers.forEach { renderer ->
-            renderer.get()?.let { pipSurface ->
-                pipSurface.setMirror(this.cameraInUse?.type == CameraType.FRONT)
-                // no need to check if already added, addSink is checking that
-                localVideoTrack?.addSink(pipSurface)
-            }
-        }
-
-        // If remote track exists, then sink it to surface
-        remoteSurfaceRenderers.forEach { renderer ->
-            renderer.get()?.let { participantSurface ->
-                remoteVideoTrack?.addSink(participantSurface)
-            }
-        }
     }
 
     private suspend fun getTurnServer(): TurnServerResponse? {
@@ -527,9 +591,11 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun setCaptureFormat(format: CaptureFormat) {
-        Timber.v("## VOIP setCaptureFormat $format")
-        videoCapturer?.changeCaptureFormat(format.width, format.height, format.fps)
-        currentCaptureFormat = format
+        sessionScope?.launch(dispatcher) {
+            Timber.v("## VOIP setCaptureFormat $format")
+            videoCapturer?.changeCaptureFormat(format.width, format.height, format.fps)
+            currentCaptureFormat = format
+        }
     }
 
     private fun updateMuteStatus() {
@@ -563,14 +629,14 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun updateRemoteOnHold(onHold: Boolean) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             if (remoteOnHold == onHold) return@launch
             val direction: RtpTransceiver.RtpTransceiverDirection
             if (onHold) {
                 wasLocalOnHold = isLocalOnHold
                 remoteOnHold = true
                 isLocalOnHold = true
-                direction = RtpTransceiver.RtpTransceiverDirection.INACTIVE
+                direction = RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
                 timer.pause()
             } else {
                 remoteOnHold = false
@@ -592,13 +658,17 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun muteCall(muted: Boolean) {
-        micMuted = muted
-        updateMuteStatus()
+        sessionScope?.launch(dispatcher) {
+            micMuted = muted
+            updateMuteStatus()
+        }
     }
 
     fun enableVideo(enabled: Boolean) {
-        videoMuted = !enabled
-        updateMuteStatus()
+        sessionScope?.launch(dispatcher) {
+            videoMuted = !enabled
+            updateMuteStatus()
+        }
     }
 
     fun canSwitchCamera(): Boolean {
@@ -615,28 +685,30 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun switchCamera() {
-        Timber.v("## VOIP switchCamera")
-        if (mxCall.state is CallState.Connected && mxCall.isVideoCall) {
-            val oppositeCamera = getOppositeCameraIfAny() ?: return
-            videoCapturer?.switchCamera(
-                    object : CameraVideoCapturer.CameraSwitchHandler {
-                        // Invoked on success. |isFrontCamera| is true if the new camera is front facing.
-                        override fun onCameraSwitchDone(isFrontCamera: Boolean) {
-                            Timber.v("## VOIP onCameraSwitchDone isFront $isFrontCamera")
-                            cameraInUse = oppositeCamera
-                            localSurfaceRenderers.forEach {
-                                it.get()?.setMirror(isFrontCamera)
+        sessionScope?.launch(dispatcher) {
+            Timber.v("## VOIP switchCamera")
+            if (mxCall.state is CallState.Connected && mxCall.isVideoCall) {
+                val oppositeCamera = getOppositeCameraIfAny() ?: return@launch
+                videoCapturer?.switchCamera(
+                        object : CameraVideoCapturer.CameraSwitchHandler {
+                            // Invoked on success. |isFrontCamera| is true if the new camera is front facing.
+                            override fun onCameraSwitchDone(isFrontCamera: Boolean) {
+                                Timber.v("## VOIP onCameraSwitchDone isFront $isFrontCamera")
+                                cameraInUse = oppositeCamera
+                                localSurfaceRenderers.forEach {
+                                    it.get()?.setMirror(isFrontCamera)
+                                }
+                                listeners.forEach {
+                                    tryOrNull { it.onCameraChanged() }
+                                }
                             }
-                            listeners.forEach {
-                                tryOrNull { it.onCameraChanged() }
-                            }
-                        }
 
-                        override fun onCameraSwitchError(errorDescription: String?) {
-                            Timber.v("## VOIP onCameraSwitchError isFront $errorDescription")
-                        }
-                    }, oppositeCamera.name
-            )
+                            override fun onCameraSwitchError(errorDescription: String?) {
+                                Timber.v("## VOIP onCameraSwitchError isFront $errorDescription")
+                            }
+                        }, oppositeCamera.name
+                )
+            }
         }
     }
 
@@ -665,11 +737,12 @@ class WebRtcCall(val mxCall: MxCall,
         return currentCaptureFormat
     }
 
-    private fun release() {
+    private suspend fun release() {
         listeners.clear()
         mxCall.removeListener(this)
         timer.stop()
         timer.tickListener = null
+        detachRenderersInternal(null)
         videoCapturer?.stopCapture()
         videoCapturer?.dispose()
         videoCapturer = null
@@ -683,16 +756,18 @@ class WebRtcCall(val mxCall: MxCall,
         localAudioTrack = null
         localVideoSource = null
         localVideoTrack = null
+        remoteAudioTrack = null
+        remoteVideoTrack = null
         cameraAvailabilityCallback = null
     }
 
     fun onAddStream(stream: MediaStream) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             // reportError("Weird-looking stream: " + stream);
             if (stream.audioTracks.size > 1 || stream.videoTracks.size > 1) {
                 Timber.e("## VOIP StreamObserver weird looking stream: $stream")
                 // TODO maybe do something more??
-                mxCall.hangUp()
+                endCall(true)
                 return@launch
             }
             if (stream.audioTracks.size == 1) {
@@ -711,7 +786,7 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun onRemoveStream() {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             remoteSurfaceRenderers
                     .mapNotNull { it.get() }
                     .forEach { remoteVideoTrack?.removeSink(it) }
@@ -720,28 +795,28 @@ class WebRtcCall(val mxCall: MxCall,
         }
     }
 
-    fun endCall(originatedByMe: Boolean = true, reason: CallHangupContent.Reason? = null) {
-        if (mxCall.state == CallState.Terminated) {
-            return
-        }
-        // Close tracks ASAP
-        localVideoTrack?.setEnabled(false)
-        localVideoTrack?.setEnabled(false)
-        cameraAvailabilityCallback?.let { cameraAvailabilityCallback ->
-            val cameraManager = context.getSystemService<CameraManager>()!!
-            cameraManager.unregisterAvailabilityCallback(cameraAvailabilityCallback)
-        }
-        val wasRinging = mxCall.state is CallState.LocalRinging
-        mxCall.state = CallState.Terminated
-        GlobalScope.launch(dispatcher) {
+    fun endCall(sendEndSignaling: Boolean = true, reason: CallHangupContent.Reason? = null) {
+        sessionScope?.launch(dispatcher) {
+            if (mxCall.state == CallState.Terminated) {
+                return@launch
+            }
+            // Close tracks ASAP
+            localVideoTrack?.setEnabled(false)
+            localVideoTrack?.setEnabled(false)
+            cameraAvailabilityCallback?.let { cameraAvailabilityCallback ->
+                val cameraManager = context.getSystemService<CameraManager>()!!
+                cameraManager.unregisterAvailabilityCallback(cameraAvailabilityCallback)
+            }
+            val wasRinging = mxCall.state is CallState.LocalRinging
+            mxCall.state = CallState.Terminated
             release()
-        }
-        onCallEnded(callId)
-        if (originatedByMe) {
-            if (wasRinging) {
-                mxCall.reject()
-            } else {
-                mxCall.hangUp(reason)
+            onCallEnded(callId)
+            if (sendEndSignaling) {
+                if (wasRinging) {
+                    mxCall.reject()
+                } else {
+                    mxCall.hangUp(reason)
+                }
             }
         }
     }
@@ -749,7 +824,7 @@ class WebRtcCall(val mxCall: MxCall,
     // Call listener
 
     fun onCallIceCandidateReceived(iceCandidatesContent: CallCandidatesContent) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             iceCandidatesContent.candidates.forEach {
                 if (it.sdpMid.isNullOrEmpty() || it.candidate.isNullOrEmpty()) {
                     return@forEach
@@ -762,7 +837,7 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun onCallAnswerReceived(callAnswerContent: CallAnswerContent) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             Timber.v("## VOIP onCallAnswerReceived ${callAnswerContent.callId}")
             val sdp = SessionDescription(SessionDescription.Type.ANSWER, callAnswerContent.answer.sdp)
             try {
@@ -778,7 +853,7 @@ class WebRtcCall(val mxCall: MxCall,
     }
 
     fun onCallNegotiateReceived(callNegotiateContent: CallNegotiateContent) {
-        GlobalScope.launch(dispatcher) {
+        sessionScope?.launch(dispatcher) {
             val description = callNegotiateContent.description
             val type = description?.type
             val sdpText = description?.sdp
@@ -829,14 +904,35 @@ class WebRtcCall(val mxCall: MxCall,
         }
     }
 
-    private fun formatDuration(duration: Duration): String {
-        val hours = duration.seconds / 3600
-        val minutes = (duration.seconds % 3600) / 60
-        val seconds = duration.seconds % 60
-        return if (hours > 0) {
-            String.format("%d:%02d:%02d", hours, minutes, seconds)
-        } else {
-            String.format("%02d:%02d", minutes, seconds)
+    fun onCallAssertedIdentityReceived(callAssertedIdentityContent: CallAssertedIdentityContent) {
+        sessionScope?.launch(dispatcher) {
+            val session = sessionProvider.get() ?: return@launch
+            val newAssertedIdentity = callAssertedIdentityContent.assertedIdentity ?: return@launch
+            if (newAssertedIdentity.id == null && newAssertedIdentity.displayName == null) {
+                Timber.v("Asserted identity received with no relevant information, skip")
+                return@launch
+            }
+            remoteAssertedIdentity = newAssertedIdentity
+            if (newAssertedIdentity.id != null) {
+                val nativeUserId = session.sipNativeLookup(newAssertedIdentity.id!!).firstOrNull()?.userId
+                if (nativeUserId != null) {
+                    val resolvedUser = tryOrNull {
+                        session.resolveUser(nativeUserId)
+                    }
+                    if (resolvedUser != null) {
+                        remoteAssertedIdentity = newAssertedIdentity.copy(
+                                id = nativeUserId,
+                                avatarUrl = resolvedUser.avatarUrl,
+                                displayName = resolvedUser.displayName
+                        )
+                    } else {
+                        remoteAssertedIdentity = newAssertedIdentity.copy(id = nativeUserId)
+                    }
+                }
+            }
+            listeners.forEach {
+                tryOrNull { it.assertedIdentityChanged() }
+            }
         }
     }
 

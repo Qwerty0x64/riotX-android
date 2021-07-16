@@ -41,7 +41,7 @@ sealed class RoomDetailViewEvents : VectorViewEvents {
     data class ShowInfoOkDialog(val message: String) : RoomDetailViewEvents()
     data class ShowE2EErrorMessage(val withHeldCode: WithHeldCode?) : RoomDetailViewEvents()
 
-    data class OpenRoom(val roomId: String) : RoomDetailViewEvents()
+    data class OpenRoom(val roomId: String, val closeCurrentRoom: Boolean = false) : RoomDetailViewEvents()
 
     data class NavigateToEvent(val eventId: String) : RoomDetailViewEvents()
     data class JoinJitsiConference(val widget: Widget, val withVideo: Boolean) : RoomDetailViewEvents()
@@ -54,12 +54,6 @@ sealed class RoomDetailViewEvents : VectorViewEvents {
     object ShowWaitingView : RoomDetailViewEvents()
     object HideWaitingView : RoomDetailViewEvents()
 
-    data class FileTooBigError(
-            val filename: String,
-            val fileSizeInBytes: Long,
-            val homeServerLimitInBytes: Long
-    ) : RoomDetailViewEvents()
-
     data class DownloadFileState(
             val mimeType: String?,
             val file: File?,
@@ -67,9 +61,8 @@ sealed class RoomDetailViewEvents : VectorViewEvents {
     ) : RoomDetailViewEvents()
 
     data class OpenFile(
-            val mimeType: String?,
-            val uri: Uri?,
-            val throwable: Throwable?
+            val uri: Uri,
+            val mimeType: String?
     ) : RoomDetailViewEvents()
 
     abstract class SendMessageResult : RoomDetailViewEvents()
@@ -101,4 +94,6 @@ sealed class RoomDetailViewEvents : VectorViewEvents {
 
     data class StartChatEffect(val type: ChatEffect) : RoomDetailViewEvents()
     object StopChatEffects : RoomDetailViewEvents()
+    object RoomReplacementStarted : RoomDetailViewEvents()
+    data class ShowRoomUpgradeDialog(val newVersion: String, val isPublic: Boolean): RoomDetailViewEvents()
 }

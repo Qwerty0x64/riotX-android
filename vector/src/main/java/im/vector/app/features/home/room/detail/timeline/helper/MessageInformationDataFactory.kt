@@ -39,6 +39,7 @@ import org.matrix.android.sdk.api.session.room.send.SendState
 import org.matrix.android.sdk.api.session.room.timeline.TimelineEvent
 import org.matrix.android.sdk.api.session.room.timeline.getLastMessageContent
 import org.matrix.android.sdk.api.session.room.timeline.hasBeenEdited
+import org.matrix.android.sdk.api.session.room.timeline.isEdition
 import org.matrix.android.sdk.internal.crypto.model.event.EncryptedEventContent
 import javax.inject.Inject
 
@@ -49,26 +50,28 @@ import javax.inject.Inject
 class MessageInformationDataFactory @Inject constructor(private val session: Session,
                                                         private val roomSummariesHolder: RoomSummariesHolder,
                                                         private val dateFormatter: VectorDateFormatter,
+                                                        private val visibilityHelper: TimelineEventVisibilityHelper,
                                                         private val vectorPreferences: VectorPreferences) {
 
     fun create(params: TimelineItemFactoryParams): MessageInformationData {
         val event = params.event
-        val nextEvent = params.nextEvent
+        val nextDisplayableEvent = params.nextDisplayableEvent
         val eventId = event.eventId
 
         val date = event.root.localDateTime()
-        val nextDate = nextEvent?.root?.localDateTime()
+        val nextDate = nextDisplayableEvent?.root?.localDateTime()
         val addDaySeparator = date.toLocalDate() != nextDate?.toLocalDate()
         val isNextMessageReceivedMoreThanOneHourAgo = nextDate?.isBefore(date.minusMinutes(60))
                 ?: false
 
         val showInformation =
                 addDaySeparator
-                        || event.senderInfo.avatarUrl != nextEvent?.senderInfo?.avatarUrl
-                        || event.senderInfo.disambiguatedDisplayName != nextEvent?.senderInfo?.disambiguatedDisplayName
-                        || (nextEvent.root.getClearType() != EventType.MESSAGE && nextEvent.root.getClearType() != EventType.ENCRYPTED)
+                        || event.senderInfo.avatarUrl != nextDisplayableEvent?.senderInfo?.avatarUrl
+                        || event.senderInfo.disambiguatedDisplayName != nextDisplayableEvent?.senderInfo?.disambiguatedDisplayName
+                        || nextDisplayableEvent.root.getClearType() !in listOf(EventType.MESSAGE, EventType.STICKER, EventType.ENCRYPTED)
                         || isNextMessageReceivedMoreThanOneHourAgo
-                        || isTileTypeMessage(nextEvent)
+                        || isTileTypeMessage(nextDisplayableEvent)
+                        || nextDisplayableEvent.isEdition()
 
         val time = dateFormatter.format(event.root.originServerTs, DateFormatKind.MESSAGE_SIMPLE)
         val e2eDecoration = getE2EDecoration(event)

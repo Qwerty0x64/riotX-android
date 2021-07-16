@@ -25,6 +25,7 @@ import org.matrix.android.sdk.api.auth.data.SessionParams
 import org.matrix.android.sdk.api.failure.Failure
 import org.matrix.android.sdk.api.failure.MatrixError
 import org.matrix.android.sdk.api.failure.getRetryDelay
+import org.matrix.android.sdk.api.session.Session
 import org.matrix.android.sdk.api.session.crypto.CryptoService
 import org.matrix.android.sdk.api.session.events.model.Event
 import org.matrix.android.sdk.api.util.Cancelable
@@ -45,7 +46,7 @@ private const val MAX_RETRY_COUNT = 3
 
 /**
  * This class is responsible for sending events in order in each room. It uses the QueuedTask.queueIdentifier to execute tasks sequentially.
- * Each send is retried 3 times, if there is no network (e.g if cannot ping home server) it will wait and
+ * Each send is retried 3 times, if there is no network (e.g if cannot ping homeserver) it will wait and
  * periodically test reachability before resume (does not count as a retry)
  *
  * If the app is killed before all event were sent, on next wakeup the scheduled events will be re posted
@@ -72,7 +73,7 @@ internal class EventSenderProcessorCoroutine @Inject constructor(
      */
     private val cancelableBag = ConcurrentHashMap<String, Cancelable>()
 
-    override fun onSessionStarted() {
+    override fun onSessionStarted(session: Session) {
         // We should check for sending events not handled because app was killed
         // But we should be careful of only took those that was submitted to us, because if it's
         // for example it's a media event it is handled by some worker and he will handle it

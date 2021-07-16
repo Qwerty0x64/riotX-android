@@ -20,6 +20,7 @@ import androidx.lifecycle.LiveData
 import androidx.paging.PagedList
 import org.matrix.android.sdk.api.session.events.model.Event
 import org.matrix.android.sdk.api.session.room.members.ChangeMembershipState
+import org.matrix.android.sdk.api.session.room.model.Membership
 import org.matrix.android.sdk.api.session.room.model.RoomMemberSummary
 import org.matrix.android.sdk.api.session.room.model.RoomSummary
 import org.matrix.android.sdk.api.session.room.model.create.CreateRoomParams
@@ -125,6 +126,12 @@ interface RoomService {
     suspend fun deleteRoomAlias(roomAlias: String)
 
     /**
+     * Return the current local changes membership for the given room.
+     * see [getChangeMembershipsLive] for more details.
+     */
+    fun getChangeMemberships(roomIdOrAlias: String): ChangeMembershipState
+
+    /**
      * Return a live data of all local changes membership that happened since the session has been opened.
      * It allows you to track this in your client to known what is currently being processed by the SDK.
      * It won't know anything about change being done in other client.
@@ -177,13 +184,15 @@ interface RoomService {
      * TODO Doc
      */
     fun getPagedRoomSummariesLive(queryParams: RoomSummaryQueryParams,
-                                  pagedListConfig: PagedList.Config = defaultPagedListConfig): LiveData<PagedList<RoomSummary>>
+                                  pagedListConfig: PagedList.Config = defaultPagedListConfig,
+                                  sortOrder: RoomSortOrder = RoomSortOrder.ACTIVITY): LiveData<PagedList<RoomSummary>>
 
     /**
      * TODO Doc
      */
     fun getFilteredPagedRoomSummariesLive(queryParams: RoomSummaryQueryParams,
-                                          pagedListConfig: PagedList.Config = defaultPagedListConfig): UpdatableFilterLivePageResult
+                                          pagedListConfig: PagedList.Config = defaultPagedListConfig,
+                                          sortOrder: RoomSortOrder = RoomSortOrder.ACTIVITY): UpdatableLivePageResult
 
     /**
      * TODO Doc
@@ -197,4 +206,12 @@ interface RoomService {
                 .setEnablePlaceholders(false)
                 .setPrefetchDistance(10)
                 .build()
+
+    fun getFlattenRoomSummaryChildrenOf(spaceId: String?, memberships: List<Membership> = Membership.activeMemberships()) : List<RoomSummary>
+
+    /**
+     * Returns all the children of this space, as LiveData
+     */
+    fun getFlattenRoomSummaryChildrenOfLive(spaceId: String?,
+                                            memberships: List<Membership> = Membership.activeMemberships()): LiveData<List<RoomSummary>>
 }
